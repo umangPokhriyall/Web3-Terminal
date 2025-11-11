@@ -1,0 +1,15 @@
+redis:
+  uri: "redis://127.0.0.1/"
+
+exchanges:
+  - name: "binance"
+    symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+
+  - name: "bybit"
+    symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+
+  - name: "kraken"
+    symbols: ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD"]
+
+  - name: "hyperliquid"
+    symbols: ["BTC", "ETH"]
