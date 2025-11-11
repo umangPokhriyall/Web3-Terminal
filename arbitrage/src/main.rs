@@ -3,11 +3,10 @@ use dashmap::DashMap;
 use futures_util::StreamExt;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::{
     collections::HashMap,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{sync::Mutex, time::sleep};
 
@@ -97,7 +96,8 @@ fn current_millis() -> u64 {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    println!("🚀 Starting Arbitrage Engine...");
+    println!("🚀 Starting Arbitrage Engine (Baseline Prototype)...");
+    let start_time = Instant::now();
 
     let redis_uri = "redis://127.0.0.1/";
     let client = redis::Client::open(redis_uri)?;
@@ -147,20 +147,50 @@ async fn main() -> Result<()> {
         ),
     ]));
 
+    // === METRICS ===
+    let recv_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let proc_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // Metrics printer
+    {
+        let recv = recv_count.clone();
+        let proc = proc_count.clone();
+        tokio::spawn(async move {
+            let mut last_recv = 0;
+            let mut last_proc = 0;
+            let mut sec = 0;
+            loop {
+                sleep(Duration::from_secs(1)).await;
+                sec += 1;
+                let curr_recv = recv.load(std::sync::atomic::Ordering::Relaxed);
+                let curr_proc = proc.load(std::sync::atomic::Ordering::Relaxed);
+                let diff_recv = curr_recv - last_recv;
+                let diff_proc = curr_proc - last_proc;
+                println!(
+                    "📊 [METRICS] +{} msgs recv/sec | +{} processed/sec | total recv={} proc={} | uptime={:.1}s",
+                    diff_recv, diff_proc, curr_recv, curr_proc, sec as f64
+                );
+                last_recv = curr_recv;
+                last_proc = curr_proc;
+            }
+        });
+    }
+
     let mut stream = sub_conn.on_message();
     while let Some(msg) = stream.next().await {
+        recv_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let payload: String = msg.get_payload()?;
+
+        let parse_start = Instant::now();
         if let Ok(v) = serde_json::from_str::<OrderBookTop>(&payload) {
+            proc_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let latency_ms = parse_start.elapsed().as_micros() as f64 / 1000.0;
+
             let symbol_key = normalize_symbol(&v.symbol);
             let mut entry = books
                 .entry(symbol_key.clone())
                 .or_insert_with(ExchangeBook::new);
-            entry.update_exchange(v.clone());
-            println!(
-                "📦 [{}] Exchanges in group: {:?}",
-                symbol_key,
-                entry.books.keys()
-            );
+            entry.update_exchange(v);
 
             if let (Some((sell_ex, sell_price, sell_qty)), Some((buy_ex, buy_price, buy_qty))) =
                 (&entry.max_bid, &entry.min_ask)
@@ -170,27 +200,12 @@ async fn main() -> Result<()> {
                 }
 
                 let gross_spread = (sell_price - buy_price) / buy_price;
-
-                // Use taker fees for both sides (since arbitrage executes immediately)
                 let buy_fee = fees.get(buy_ex).map(|f| f.taker).unwrap_or(0.001);
                 let sell_fee = fees.get(sell_ex).map(|f| f.taker).unwrap_or(0.001);
                 let net_spread = gross_spread - (buy_fee + sell_fee);
-
                 let volume = buy_qty.min(*sell_qty);
                 let now = current_millis();
 
-                println!(
-                    "[{}] {} → {} | Spread: {:.4}% | Net: {:.4}% | Buy: {:.2} | Sell: {:.2}",
-                    symbol_key,
-                    buy_ex,
-                    sell_ex,
-                    gross_spread * 100.0,
-                    net_spread * 100.0,
-                    buy_price,
-                    sell_price
-                );
-
-                // Optionally publish only if profitable
                 if net_spread > 0.0005 {
                     let arb = ArbitrageSignal {
                         symbol: symbol_key.clone(),
@@ -209,9 +224,21 @@ async fn main() -> Result<()> {
                     let _: () = pub_conn.publish("signals:arbitrage", payload).await?;
                 }
             }
+
+            if (recv_count.load(std::sync::atomic::Ordering::Relaxed) % 1000) == 0 {
+                println!(
+                    "🧩 [DEBUG] Avg parse latency: {:.3} ms | total recv: {}",
+                    latency_ms,
+                    recv_count.load(std::sync::atomic::Ordering::Relaxed)
+                );
+            }
         }
     }
 
+    println!(
+        "🏁 Engine stopped after {:.2}s",
+        start_time.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 

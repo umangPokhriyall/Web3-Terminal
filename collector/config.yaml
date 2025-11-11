@@ -3,13 +3,13 @@ redis:
 
 exchanges:
   - name: "binance"
-    symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+    symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "LTCUSDT", "AVAXUSDT", "DOTUSDT", "BNBUSDT"]
 
   - name: "bybit"
-    symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+    symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "LTCUSDT", "AVAXUSDT", "DOTUSDT", "BNBUSDT"]
 
   - name: "kraken"
-    symbols: ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD"]
+    symbols: ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "DOGE/USD", "ADA/USD", "LTC/USD", "AVAX/USD", "DOT/USD", "BNB/USD"]
 
   - name: "hyperliquid"
-    symbols: ["BTC", "ETH"]
+    symbols: ["BTC", "ETH", "SOL", "XRP", "ADA"]
