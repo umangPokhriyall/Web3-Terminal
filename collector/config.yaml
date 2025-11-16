@@ -3,13 +3,19 @@ redis:
 
 exchanges:
   - name: "binance"
-    symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "LTCUSDT", "AVAXUSDT", "DOTUSDT", "BNBUSDT"]
+    symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "LTCUSDT", "AVAXUSDT", "DOTUSDT", "BNBUSDT",
+              "LINKUSDT", "MATICUSDT", "TRXUSDT", "UNIUSDT", "APTUSDT", "ARBUSDT", "OPUSDT", "ATOMUSDT", "SUIUSDT", "FILUSDT"]
+  # - name: "binance2"
+  #   symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "LTCUSDT", "AVAXUSDT", "DOTUSDT", "BNBUSDT",
+  #             "LINKUSDT", "MATICUSDT", "TRXUSDT", "UNIUSDT", "APTUSDT", "ARBUSDT", "OPUSDT", "ATOMUSDT", "SUIUSDT", "FILUSDT"]
 
   - name: "bybit"
-    symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "LTCUSDT", "AVAXUSDT", "DOTUSDT", "BNBUSDT"]
+    symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "LTCUSDT", "AVAXUSDT", "DOTUSDT", "BNBUSDT",
+              "LINKUSDT", "MATICUSDT", "TRXUSDT", "UNIUSDT", "APTUSDT", "ARBUSDT", "OPUSDT", "ATOMUSDT", "SUIUSDT", "FILUSDT"]
 
   - name: "kraken"
-    symbols: ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "DOGE/USD", "ADA/USD", "LTC/USD", "AVAX/USD", "DOT/USD", "BNB/USD"]
+    symbols: ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "DOGE/USD", "ADA/USD", "LTC/USD", "AVAX/USD", "DOT/USD", "BNB/USD",
+              "LINK/USD", "MATIC/USD", "TRX/USD", "UNI/USD", "APT/USD", "ARB/USD", "OP/USD", "ATOM/USD", "SUI/USD", "FIL/USD"]
 
   - name: "hyperliquid"
-    symbols: ["BTC", "ETH", "SOL", "XRP", "ADA"]
+    symbols: ["BTC", "ETH", "SOL", "XRP", "ADA", "LTC", "DOT", "BNB", "AVAX", "DOGE"]

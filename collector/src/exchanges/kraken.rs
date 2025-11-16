@@ -1,10 +1,15 @@
+// kraken.rs (rewritten, TOB-only, fast, SIMD + bincode + batched streams)
+
 use crate::exchange::{
     ExchangeClient, NormalizedData, OrderBookSnapshot, OrderBookTop, TradeEvent,
 };
+use crate::metrics::ThroughputMetrics;
+
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use redis::AsyncCommands;
 use serde_json::Value;
+
 use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -16,9 +21,13 @@ use tokio::{
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url;
 
+// high-speed JSON + binary
+use bincode;
+use simd_json;
+
 #[derive(Clone)]
 pub struct KrakenCollector {
-    pub symbols: Vec<String>, // e.g. ["XBT/USD", "ETH/USD"]
+    pub symbols: Vec<String>, // ["BTC/USD", "ETH/USD", ...]
     pub redis_client: redis::Client,
 }
 
@@ -29,13 +38,12 @@ impl ExchangeClient for KrakenCollector {
     }
 
     async fn connect_price_stream(&mut self) -> Result<()> {
-        self.connect_combined_stream().await
+        self.run_resilient().await
     }
 
     async fn connect_orderbook_stream(&mut self) -> Result<()> {
         Ok(())
     }
-
     async fn connect_trades_stream(&mut self) -> Result<()> {
         Ok(())
     }
@@ -50,28 +58,37 @@ impl ExchangeClient for KrakenCollector {
 }
 
 impl KrakenCollector {
-    pub async fn connect_combined_stream(&mut self) -> Result<()> {
+    pub async fn run_resilient(&mut self) -> Result<()> {
         loop {
-            match self.inner_connect().await {
+            match self.run().await {
                 Ok(_) => return Ok(()),
                 Err(e) => {
-                    eprintln!("❌ [Kraken] Stream error: {:?}. Reconnecting in 5s...", e);
-                    sleep(Duration::from_secs(5)).await;
+                    eprintln!("❌ [Kraken] Error: {e:?}, retry in 3s...");
+                    sleep(Duration::from_secs(3)).await;
                 }
             }
         }
     }
 
-    async fn inner_connect(&mut self) -> Result<()> {
+    async fn run(&mut self) -> Result<()> {
         let url = Url::parse("wss://ws.kraken.com/v2")?;
         let (ws, _) = connect_async(url).await?;
-        println!("✅ [Kraken] Connected combined stream ({:?})", self.symbols);
+        println!("✅ [Kraken] Connected stream: {:?}", self.symbols);
 
         let (write, mut read) = ws.split();
         let write = Arc::new(Mutex::new(write));
-        let mut redis_conn = self.redis_client.get_async_connection().await?;
 
-        // Subscriptions: ticker, trade, book
+        let redis_client = self.redis_client.clone();
+        let mut redis_conn = redis_client.get_async_connection().await?;
+
+        // Metrics
+        let metrics = ThroughputMetrics::new();
+        let metrics_clone = metrics.clone();
+        tokio::spawn(async move {
+            metrics_clone.start_logger("kraken", "main").await;
+        });
+
+        // Subscriptions
         let subs = vec![
             serde_json::json!({"method":"subscribe","params":{"channel":"ticker","symbol":self.symbols}}),
             serde_json::json!({"method":"subscribe","params":{"channel":"trade","symbol":self.symbols}}),
@@ -81,164 +98,283 @@ impl KrakenCollector {
         for sub in subs {
             let mut w = write.lock().await;
             w.send(Message::Text(sub.to_string())).await?;
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(200)).await;
         }
 
-        // Ping loop
-        let ping_writer = write.clone();
-        tokio::spawn(async move {
-            loop {
-                sleep(Duration::from_secs(25)).await;
-                let ping = serde_json::json!({"method": "ping"});
-                if let Err(e) = ping_writer
-                    .lock()
-                    .await
-                    .send(Message::Text(ping.to_string()))
-                    .await
-                {
-                    eprintln!("❌ [Kraken] ping error: {:?}", e);
-                    break;
-                }
-            }
-        });
+        // batching
+        const BATCH: usize = 100;
+        const MAXLEN: usize = 10_000;
 
-        // Reader
+        let mut batch_prices: Vec<Vec<u8>> = Vec::with_capacity(BATCH);
+        let mut batch_orderbook: Vec<Vec<u8>> = Vec::with_capacity(BATCH);
+        let mut batch_trades: Vec<Vec<u8>> = Vec::with_capacity(BATCH);
+
+        // === main loop ===
         while let Some(msg) = read.next().await {
             let msg = msg?;
             if !msg.is_text() {
                 continue;
             }
 
+            metrics.incr_recv();
+
             let txt = msg.to_text()?;
-            if txt.contains("\"heartbeat\"") {
+            if txt.contains("heartbeat") {
                 continue;
             }
 
-            let parsed: Value = match serde_json::from_str(txt) {
+            // SIMD parse
+            let mut bytes = txt.as_bytes().to_vec();
+            let parsed: Value = match simd_json::serde::from_slice(&mut bytes) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
 
-            if let Some(ch) = parsed.get("channel").and_then(|x| x.as_str()) {
-                match ch {
-                    "ticker" => handle_ticker(&parsed, &mut redis_conn).await?,
-                    "trade" => handle_trade(&parsed, &mut redis_conn).await?,
-                    "book" => handle_orderbook(&parsed, &mut redis_conn).await?,
-                    _ => {}
+            let Some(channel) = parsed.get("channel").and_then(|v| v.as_str()) else {
+                continue;
+            };
+
+            match channel {
+                "ticker" => {
+                    handle_ticker(&parsed, &mut batch_prices, &metrics)?;
+                    flush_if(
+                        &mut batch_prices,
+                        "prices:kraken",
+                        MAXLEN,
+                        BATCH,
+                        &mut redis_conn,
+                    )
+                    .await?;
                 }
+
+                "trade" => {
+                    handle_trades(&parsed, &mut batch_trades, &metrics)?;
+                    flush_if(
+                        &mut batch_trades,
+                        "trades:kraken",
+                        MAXLEN,
+                        BATCH,
+                        &mut redis_conn,
+                    )
+                    .await?;
+                }
+
+                "book" => {
+                    handle_book(&parsed, &mut batch_orderbook, &metrics)?;
+                    flush_if(
+                        &mut batch_orderbook,
+                        "orderbook:kraken",
+                        MAXLEN,
+                        BATCH,
+                        &mut redis_conn,
+                    )
+                    .await?;
+                }
+
+                _ => {}
             }
         }
+
+        // flush everything
+        flush_all("prices:kraken", &mut batch_prices, MAXLEN, &mut redis_conn).await?;
+        flush_all("trades:kraken", &mut batch_trades, MAXLEN, &mut redis_conn).await?;
+        flush_all(
+            "orderbook:kraken",
+            &mut batch_orderbook,
+            MAXLEN,
+            &mut redis_conn,
+        )
+        .await?;
 
         Ok(())
     }
 }
 
-// --- HANDLERS ---
+//
+// ===== Handlers (super fast, TOB-only) =====
+//
 
-async fn handle_ticker(msg: &Value, redis: &mut redis::aio::Connection) -> Result<()> {
-    if let Some(arr) = msg.get("data").and_then(|x| x.as_array()) {
-        for item in arr {
-            let raw_symbol = item.get("symbol").and_then(|x| x.as_str()).unwrap_or("");
-            let symbol = normalize_symbol(raw_symbol);
-            let price = item.get("last").and_then(|x| x.as_f64()).unwrap_or(0.0);
-            let volume = item.get("volume").and_then(|x| x.as_f64()).unwrap_or(0.0);
-            let high = item.get("high").and_then(|x| x.as_f64()).unwrap_or(0.0);
-            let low = item.get("low").and_then(|x| x.as_f64()).unwrap_or(0.0);
+fn handle_ticker(msg: &Value, batch: &mut Vec<Vec<u8>>, metrics: &ThroughputMetrics) -> Result<()> {
+    let Some(arr) = msg.get("data").and_then(|v| v.as_array()) else {
+        return Ok(());
+    };
 
-            if !symbol.is_empty() && price > 0.0 {
-                let data = NormalizedData {
-                    exchange: "kraken".into(),
-                    symbol: symbol.to_string(),
-                    price,
-                    volume,
-                    high,
-                    low,
-                    timestamp: current_millis(),
-                };
-                let payload = serde_json::to_string(&data)?;
-                let _: () = redis.publish("prices:kraken", payload).await?;
-            }
+    for item in arr {
+        let sym_raw = item.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+        let symbol = normalize_symbol(sym_raw);
+
+        let price = item.get("last").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if price <= 0.0 {
+            continue;
         }
+
+        let data = NormalizedData {
+            exchange: "kraken".into(),
+            symbol: symbol.to_string(),
+            price,
+            volume: item.get("volume").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            high: item.get("high").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            low: item.get("low").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            timestamp: now_ms(),
+        };
+
+        if let Ok(payload) = bincode::serialize(&data) {
+            batch.push(payload);
+        }
+
+        metrics.incr_pub();
     }
+
     Ok(())
 }
 
-async fn handle_trade(msg: &Value, redis: &mut redis::aio::Connection) -> Result<()> {
-    if let Some(arr) = msg.get("data").and_then(|x| x.as_array()) {
-        for trade in arr {
-            let raw_symbol = trade.get("symbol").and_then(|x| x.as_str()).unwrap_or("");
-            let symbol = normalize_symbol(raw_symbol);
-            let price = trade.get("price").and_then(|x| x.as_f64()).unwrap_or(0.0);
-            let qty = trade.get("qty").and_then(|x| x.as_f64()).unwrap_or(0.0);
-            let side = trade.get("side").and_then(|x| x.as_str()).unwrap_or("buy");
+fn handle_trades(msg: &Value, batch: &mut Vec<Vec<u8>>, metrics: &ThroughputMetrics) -> Result<()> {
+    let Some(arr) = msg.get("data").and_then(|v| v.as_array()) else {
+        return Ok(());
+    };
 
-            if !symbol.is_empty() && price > 0.0 && qty > 0.0 {
-                let event = TradeEvent {
-                    exchange: "kraken".into(),
-                    symbol: symbol.to_string(),
-                    price,
-                    qty,
-                    side: side.to_string(),
-                    timestamp: current_millis(),
-                };
-                let payload = serde_json::to_string(&event)?;
-                let _: () = redis.publish("trades:kraken", payload).await?;
-            }
+    for tr in arr {
+        let sym_raw = tr.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+        let symbol = normalize_symbol(sym_raw);
+
+        let price = tr.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let qty = tr.get("qty").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if price <= 0.0 || qty <= 0.0 {
+            continue;
         }
+
+        let ev = TradeEvent {
+            exchange: "kraken".into(),
+            symbol: symbol.to_string(),
+            price,
+            qty,
+            side: tr
+                .get("side")
+                .and_then(|v| v.as_str())
+                .unwrap_or("buy")
+                .to_string(),
+            timestamp: now_ms(),
+        };
+
+        if let Ok(payload) = bincode::serialize(&ev) {
+            batch.push(payload);
+        }
+
+        metrics.incr_pub();
     }
+
     Ok(())
 }
 
-async fn handle_orderbook(msg: &Value, redis: &mut redis::aio::Connection) -> Result<()> {
-    if let Some(arr) = msg.get("data").and_then(|x| x.as_array()) {
-        for ob in arr {
-            let raw_symbol = ob.get("symbol").and_then(|x| x.as_str()).unwrap_or("");
-            let symbol = normalize_symbol(raw_symbol);
+fn handle_book(msg: &Value, batch: &mut Vec<Vec<u8>>, metrics: &ThroughputMetrics) -> Result<()> {
+    let Some(arr) = msg.get("data").and_then(|v| v.as_array()) else {
+        return Ok(());
+    };
+    let _type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-            let bid = ob
-                .get("bids")
-                .and_then(|b| b.get(0))
-                .and_then(|x| x.get("price"))
-                .and_then(|x| x.as_f64())
-                .unwrap_or(0.0);
-            let bid_qty = ob
-                .get("bids")
-                .and_then(|b| b.get(0))
-                .and_then(|x| x.get("qty"))
-                .and_then(|x| x.as_f64())
-                .unwrap_or(0.0);
-            let ask = ob
-                .get("asks")
-                .and_then(|a| a.get(0))
-                .and_then(|x| x.get("price"))
-                .and_then(|x| x.as_f64())
-                .unwrap_or(0.0);
-            let ask_qty = ob
-                .get("asks")
-                .and_then(|a| a.get(0))
-                .and_then(|x| x.get("qty"))
-                .and_then(|x| x.as_f64())
-                .unwrap_or(0.0);
+    for ob in arr {
+        let sym_raw = ob.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+        let symbol = normalize_symbol(sym_raw);
 
-            if !symbol.is_empty() && (bid > 0.0 || ask > 0.0) {
-                let data = OrderBookTop {
-                    exchange: "kraken".into(),
-                    symbol: symbol.to_string(),
-                    bid,
-                    ask,
-                    bid_qty,
-                    ask_qty,
-                    timestamp: current_millis(),
-                };
-                let payload = serde_json::to_string(&data)?;
-                let _: () = redis.publish("orderbook:kraken", payload).await?;
-            }
+        let bids = ob
+            .get("bids")
+            .and_then(|v| v.as_array())
+            .map_or(&[][..], |v| v);
+
+        let asks = ob
+            .get("asks")
+            .and_then(|v| v.as_array())
+            .map_or(&[][..], |v| v);
+
+        let best_bid = bids
+            .first()
+            .and_then(|x| x.get("price").and_then(|v| v.as_f64()))
+            .unwrap_or(0.0);
+
+        let bid_qty = bids
+            .first()
+            .and_then(|x| x.get("qty").and_then(|v| v.as_f64()))
+            .unwrap_or(0.0);
+
+        let best_ask = asks
+            .first()
+            .and_then(|x| x.get("price").and_then(|v| v.as_f64()))
+            .unwrap_or(0.0);
+
+        let ask_qty = asks
+            .first()
+            .and_then(|x| x.get("qty").and_then(|v| v.as_f64()))
+            .unwrap_or(0.0);
+
+        if best_bid == 0.0 || best_ask == 0.0 {
+            continue;
         }
+
+        let tob = OrderBookTop {
+            exchange: "kraken".into(),
+            symbol: symbol.to_string(),
+            bid: best_bid,
+            ask: best_ask,
+            bid_qty,
+            ask_qty,
+            timestamp: now_ms(),
+        };
+
+        if let Ok(payload) = bincode::serialize(&tob) {
+            batch.push(payload);
+        }
+
+        metrics.incr_pub();
     }
+
     Ok(())
 }
 
-// --- HELPERS ---
+//
+// ===== Batch flush helpers =====
+//
+
+async fn flush_if(
+    batch: &mut Vec<Vec<u8>>,
+    stream: &str,
+    maxlen: usize,
+    limit: usize,
+    redis: &mut redis::aio::Connection,
+) -> Result<()> {
+    if batch.len() < limit {
+        return Ok(());
+    }
+    flush_all(stream, batch, maxlen, redis).await
+}
+
+async fn flush_all(
+    stream: &str,
+    batch: &mut Vec<Vec<u8>>,
+    maxlen: usize,
+    redis: &mut redis::aio::Connection,
+) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+
+    let mut pipe = redis::pipe();
+    for msg in batch.drain(..) {
+        pipe.cmd("XADD")
+            .arg(stream)
+            .arg("MAXLEN")
+            .arg("~")
+            .arg(maxlen)
+            .arg("*")
+            .arg("data")
+            .arg(msg);
+    }
+    let _: redis::RedisResult<()> = pipe.query_async(redis).await;
+    Ok(())
+}
+
+//
+// ===== Helpers =====
+//
 
 fn normalize_symbol(s: &str) -> &str {
     match s {
@@ -246,11 +382,11 @@ fn normalize_symbol(s: &str) -> &str {
         "ETH/USD" => "ETHUSDT",
         "SOL/USD" => "SOLUSDT",
         "XRP/USD" => "XRPUSDT",
-        _ => s,
+        other => other,
     }
 }
 
-fn current_millis() -> u64 {
+fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()

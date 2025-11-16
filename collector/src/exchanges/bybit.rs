@@ -1,11 +1,13 @@
+// bybit.rs (rewritten, optimized, compatible with your collectors)
 use crate::exchange::{
     ExchangeClient, NormalizedData, OrderBookSnapshot, OrderBookTop, TradeEvent,
 };
+use crate::metrics::ThroughputMetrics;
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use redis::AsyncCommands;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -15,17 +17,39 @@ use tokio::{
     sync::Mutex,
     time::{Duration, sleep},
 };
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url;
 
-/// Bybit collector (public spot channels)
+// fast binary serializer
+use bincode;
+
+/// Collector for Bybit (v5 public spot)
 #[derive(Clone)]
 pub struct BybitCollector {
-    pub symbols: Vec<String>, // e.g. ["BTCUSDT", "ETHUSDT"]
+    pub symbols: Vec<String>,
     pub redis_client: redis::Client,
+    /// topics per WS connection (tune when testing)
+    pub max_topics_per_conn: usize,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+impl Default for BybitCollector {
+    fn default() -> Self {
+        Self {
+            symbols: vec![],
+            redis_client: redis::Client::open("redis://127.0.0.1/").unwrap(),
+            max_topics_per_conn: 9,
+        }
+    }
+}
+
+// batching and connectivity
+const BATCH_FLUSH: usize = 100;
+const MAXLEN: usize = 10_000;
+const PING_INTERVAL_SECS: u64 = 20;
+const RECONNECT_BASE_MS: u64 = 500;
+const RECONNECT_MAX_SECS: u64 = 60;
+
+#[derive(serde::Deserialize, serde::Serialize, Debug)]
 struct BybitTickerData {
     symbol: String,
     #[serde(rename = "lastPrice")]
@@ -44,334 +68,67 @@ impl ExchangeClient for BybitCollector {
         "bybit"
     }
 
-    /// Price/ticker stream -> publish to prices:bybit
     async fn connect_price_stream(&mut self) -> Result<()> {
-        let url = Url::parse("wss://stream.bybit.com/v5/public/spot")?;
-        let (ws_stream, _) = connect_async(url).await?;
-        println!("✅ [Bybit] Connected price stream ({:?})", self.symbols);
+        // we'll handle tickers, orderbook.1 (TOB), and publicTrade topics here,
+        // splitting them into multiple connections if needed.
+        let symbols = self.symbols.clone();
+        let redis_client = self.redis_client.clone();
+        let max_per_conn = std::cmp::max(self.max_topics_per_conn, 1);
 
-        let (write, mut read) = ws_stream.split();
-        let write = Arc::new(Mutex::new(write));
-
-        // Subscribe to tickers
-        let topics: Vec<String> = self
-            .symbols
-            .iter()
-            .map(|s| format!("tickers.{}", s))
-            .collect();
-        let sub = serde_json::json!({"op": "subscribe", "args": topics});
-        {
-            let mut writer = write.lock().await;
-            writer
-                .send(tokio_tungstenite::tungstenite::Message::Text(
-                    sub.to_string(),
-                ))
-                .await?;
+        // build topics
+        let mut topics = Vec::with_capacity(symbols.len() * 3);
+        for s in &symbols {
+            topics.push(format!("tickers.{}", s));
+            topics.push(format!("orderbook.1.{}", s)); // top-of-book
+            topics.push(format!("publicTrade.{}", s));
         }
 
-        // Ping every 20s
-        {
-            let w = Arc::clone(&write);
+        for (i, chunk) in topics.chunks(max_per_conn).enumerate() {
+            let chunk_topics = chunk.to_vec();
+            let rclient = redis_client.clone();
+
+            // metrics per connection
+            let metrics = ThroughputMetrics::new();
+            let label = format!("conn{}", i);
+            let metrics_clone = metrics.clone();
             tokio::spawn(async move {
+                metrics_clone.start_logger("bybit", &label).await;
+            });
+
+            // spawn connection task with stagger & reconnect
+            tokio::spawn(async move {
+                sleep(Duration::from_millis(200 * (i as u64))).await;
+                let mut backoff = Duration::from_millis(RECONNECT_BASE_MS);
                 loop {
-                    sleep(Duration::from_secs(20)).await;
-                    let ping = serde_json::json!({"op": "ping"});
-                    let mut writer = w.lock().await;
-                    if let Err(e) = writer
-                        .send(tokio_tungstenite::tungstenite::Message::Text(
-                            ping.to_string(),
-                        ))
-                        .await
-                    {
-                        eprintln!("❌ [Bybit] Price ping error: {:?}", e);
-                        break;
+                    match run_bybit_conn(chunk_topics.clone(), &rclient, metrics.clone()).await {
+                        Ok(_) => {
+                            backoff = Duration::from_millis(RECONNECT_BASE_MS);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "❌ [Bybit] conn ({}topics) failed: {:?}. reconnecting {:?}",
+                                chunk_topics.len(),
+                                e,
+                                backoff
+                            );
+                            let jitter = rand::random::<u64>() % 1000;
+                            sleep(backoff + Duration::from_millis(jitter)).await;
+                            backoff =
+                                std::cmp::min(backoff * 2, Duration::from_secs(RECONNECT_MAX_SECS));
+                        }
                     }
                 }
             });
         }
 
-        let mut redis_conn = self.redis_client.get_async_connection().await?;
-        while let Some(msg) = read.next().await {
-            let msg = msg?;
-            if !msg.is_text() {
-                continue;
-            }
-            let txt = msg.to_text()?;
-            if let Ok(v) = serde_json::from_str::<Value>(txt) {
-                if let Some(topic) = v.get("topic").and_then(|t| t.as_str()) {
-                    if topic.starts_with("tickers.") {
-                        if let Some(data) = v.get("data") {
-                            if let Ok(td) = serde_json::from_value::<BybitTickerData>(data.clone())
-                            {
-                                let nd = NormalizedData {
-                                    exchange: "bybit".into(),
-                                    symbol: td.symbol.clone(),
-                                    price: td
-                                        .last_price
-                                        .as_deref()
-                                        .unwrap_or("0")
-                                        .parse()
-                                        .unwrap_or(0.0),
-                                    volume: td
-                                        .volume_24h
-                                        .as_deref()
-                                        .unwrap_or("0")
-                                        .parse()
-                                        .unwrap_or(0.0),
-                                    high: td
-                                        .high_24h
-                                        .as_deref()
-                                        .unwrap_or("0")
-                                        .parse()
-                                        .unwrap_or(0.0),
-                                    low: td
-                                        .low_24h
-                                        .as_deref()
-                                        .unwrap_or("0")
-                                        .parse()
-                                        .unwrap_or(0.0),
-                                    timestamp: v
-                                        .get("ts")
-                                        .and_then(|x| x.as_u64())
-                                        .unwrap_or(current_millis()),
-                                };
-                                let payload = serde_json::to_string(&nd)?;
-                                let _: () = redis_conn.publish("prices:bybit", payload).await?;
-                                println!(
-                                    "[Bybit] {} | Price: {} | Vol: {}",
-                                    nd.symbol, nd.price, nd.volume
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
         Ok(())
     }
 
-    /// Orderbook stream (level 1)
     async fn connect_orderbook_stream(&mut self) -> Result<()> {
-        let url = Url::parse("wss://stream.bybit.com/v5/public/spot")?;
-        let (ws_stream, _) = connect_async(url).await?;
-        println!("✅ [Bybit] Connected orderbook stream ({:?})", self.symbols);
-
-        let (write, mut read) = ws_stream.split();
-        let write = Arc::new(Mutex::new(write));
-
-        let topics: Vec<String> = self
-            .symbols
-            .iter()
-            .map(|s| format!("orderbook.1.{}", s))
-            .collect();
-        let sub = serde_json::json!({"op": "subscribe", "args": topics});
-        {
-            let mut writer = write.lock().await;
-            writer
-                .send(tokio_tungstenite::tungstenite::Message::Text(
-                    sub.to_string(),
-                ))
-                .await?;
-        }
-
-        // Ping every 20s
-        {
-            let w = Arc::clone(&write);
-            tokio::spawn(async move {
-                loop {
-                    sleep(Duration::from_secs(20)).await;
-                    let ping = serde_json::json!({"op": "ping"});
-                    let mut writer = w.lock().await;
-                    if let Err(e) = writer
-                        .send(tokio_tungstenite::tungstenite::Message::Text(
-                            ping.to_string(),
-                        ))
-                        .await
-                    {
-                        eprintln!("❌ [Bybit] Orderbook ping error: {:?}", e);
-                        break;
-                    }
-                }
-            });
-        }
-
-        let mut redis_conn = self.redis_client.get_async_connection().await?;
-        let mut best: HashMap<String, (f64, f64, f64, f64)> = HashMap::new();
-
-        while let Some(msg) = read.next().await {
-            let msg = msg?;
-            if !msg.is_text() {
-                continue;
-            }
-            let txt = msg.to_text()?;
-            if let Ok(v) = serde_json::from_str::<Value>(txt) {
-                if let Some(topic) = v.get("topic").and_then(|t| t.as_str()) {
-                    if topic.starts_with("orderbook.1.") {
-                        if let Some(data) = v.get("data") {
-                            let symbol = topic.trim_start_matches("orderbook.1.").to_string();
-                            let bids = data
-                                .get("b")
-                                .and_then(|b| b.as_array())
-                                .cloned()
-                                .unwrap_or_default();
-                            let asks = data
-                                .get("a")
-                                .and_then(|a| a.as_array())
-                                .cloned()
-                                .unwrap_or_default();
-                            if bids.is_empty() || asks.is_empty() {
-                                continue;
-                            }
-
-                            let (bid, bid_qty) = (
-                                bids[0][0]
-                                    .as_str()
-                                    .unwrap_or("0")
-                                    .parse::<f64>()
-                                    .unwrap_or(0.0),
-                                bids[0][1]
-                                    .as_str()
-                                    .unwrap_or("0")
-                                    .parse::<f64>()
-                                    .unwrap_or(0.0),
-                            );
-                            let (ask, ask_qty) = (
-                                asks[0][0]
-                                    .as_str()
-                                    .unwrap_or("0")
-                                    .parse::<f64>()
-                                    .unwrap_or(0.0),
-                                asks[0][1]
-                                    .as_str()
-                                    .unwrap_or("0")
-                                    .parse::<f64>()
-                                    .unwrap_or(0.0),
-                            );
-
-                            best.insert(symbol.clone(), (bid, ask, bid_qty, ask_qty));
-
-                            let ob = OrderBookTop {
-                                exchange: "bybit".into(),
-                                symbol: symbol.clone(),
-                                bid,
-                                ask,
-                                bid_qty,
-                                ask_qty,
-                                timestamp: v
-                                    .get("ts")
-                                    .and_then(|t| t.as_u64())
-                                    .unwrap_or(current_millis()),
-                            };
-                            let payload = serde_json::to_string(&ob)?;
-                            let _: () = redis_conn.publish("orderbook:bybit", payload).await?;
-                        }
-                    }
-                }
-            }
-        }
+        // topics already created in connect_price_stream
         Ok(())
     }
-
-    /// Trades stream
     async fn connect_trades_stream(&mut self) -> Result<()> {
-        let url = Url::parse("wss://stream.bybit.com/v5/public/spot")?;
-        let (ws_stream, _) = connect_async(url).await?;
-        println!("✅ [Bybit] Connected trades stream ({:?})", self.symbols);
-
-        let (write, mut read) = ws_stream.split();
-        let write = Arc::new(Mutex::new(write));
-
-        let topics: Vec<String> = self
-            .symbols
-            .iter()
-            .map(|s| format!("publicTrade.{}", s))
-            .collect();
-        let sub = serde_json::json!({"op": "subscribe", "args": topics});
-        {
-            let mut writer = write.lock().await;
-            writer
-                .send(tokio_tungstenite::tungstenite::Message::Text(
-                    sub.to_string(),
-                ))
-                .await?;
-        }
-
-        // Ping every 20s
-        {
-            let w = Arc::clone(&write);
-            tokio::spawn(async move {
-                loop {
-                    sleep(Duration::from_secs(20)).await;
-                    let ping = serde_json::json!({"op": "ping"});
-                    let mut writer = w.lock().await;
-                    if let Err(e) = writer
-                        .send(tokio_tungstenite::tungstenite::Message::Text(
-                            ping.to_string(),
-                        ))
-                        .await
-                    {
-                        eprintln!("❌ [Bybit] Trades ping error: {:?}", e);
-                        break;
-                    }
-                }
-            });
-        }
-
-        let mut redis_conn = self.redis_client.get_async_connection().await?;
-        while let Some(msg) = read.next().await {
-            let msg = msg?;
-            if !msg.is_text() {
-                continue;
-            }
-            let txt = msg.to_text()?;
-            if let Ok(v) = serde_json::from_str::<Value>(txt) {
-                if let Some(topic) = v.get("topic").and_then(|t| t.as_str()) {
-                    if topic.starts_with("publicTrade.") {
-                        if let Some(arr) = v.get("data").and_then(|x| x.as_array()) {
-                            for trade in arr {
-                                let symbol = trade
-                                    .get("s")
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let side = trade
-                                    .get("S")
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or("Buy")
-                                    .to_lowercase();
-                                let qty = trade
-                                    .get("v")
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or("0")
-                                    .parse::<f64>()
-                                    .unwrap_or(0.0);
-                                let price = trade
-                                    .get("p")
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or("0")
-                                    .parse::<f64>()
-                                    .unwrap_or(0.0);
-                                let tstamp = trade
-                                    .get("T")
-                                    .and_then(|x| x.as_u64())
-                                    .unwrap_or(current_millis());
-
-                                let event = TradeEvent {
-                                    exchange: "bybit".into(),
-                                    symbol: symbol.clone(),
-                                    price,
-                                    qty,
-                                    side,
-                                    timestamp: tstamp,
-                                };
-                                let payload = serde_json::to_string(&event)?;
-                                let _: () = redis_conn.publish("trades:bybit", payload).await?;
-                            }
-                        }
-                    }
-                }
-            }
-        }
         Ok(())
     }
 
@@ -382,6 +139,402 @@ impl ExchangeClient for BybitCollector {
             asks: vec![],
         })
     }
+}
+
+/// Run single Bybit WS connection (topics provided)
+async fn run_bybit_conn(
+    topics: Vec<String>,
+    redis_client: &redis::Client,
+    metrics: ThroughputMetrics,
+) -> Result<()> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let url = Url::parse("wss://stream.bybit.com/v5/public/spot")?;
+    let mut req = url.into_client_request()?;
+    req.headers_mut()
+        .insert("User-Agent", "web3-terminal/collector".parse().unwrap());
+
+    let (ws_stream, _) = connect_async(req).await?;
+    println!("✅ [Bybit] handshake OK ({} topics)", topics.len());
+
+    let (write, mut read) = ws_stream.split();
+    let write = Arc::new(Mutex::new(write));
+
+    // Subscribe once
+    let subscribe = serde_json::json!({ "op": "subscribe", "args": topics });
+    {
+        let mut w = write.lock().await;
+        w.send(Message::Text(subscribe.to_string())).await?;
+    }
+
+    // ping loop
+    let ping_writer = write.clone();
+    let ping_handle = tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(PING_INTERVAL_SECS)).await;
+            let ping = serde_json::json!({ "op": "ping" });
+            let mut w = ping_writer.lock().await;
+            if let Err(e) = w.send(Message::Text(ping.to_string())).await {
+                eprintln!("❌ [Bybit] ping failed: {:?}", e);
+                break;
+            }
+        }
+    });
+
+    // Redis batching buffers
+    let mut redis_conn = redis_client.get_async_connection().await?;
+    let mut batch_prices: Vec<Vec<u8>> = Vec::with_capacity(BATCH_FLUSH);
+    let mut batch_orderbooks: Vec<Vec<u8>> = Vec::with_capacity(BATCH_FLUSH);
+    let mut batch_trades: Vec<Vec<u8>> = Vec::with_capacity(BATCH_FLUSH);
+
+    // optional small in-memory TOB cache per connection
+    let mut best: HashMap<String, (f64, f64, f64, f64)> = HashMap::new();
+
+    while let Some(msg) = read.next().await {
+        let msg = msg?;
+        if !msg.is_text() {
+            continue;
+        }
+
+        metrics.incr_recv();
+
+        // parse fast (simd-json expects mutable bytes)
+        let mut bytes = msg.to_text()?.as_bytes().to_vec();
+        let mut v: Value = match simd_json::serde::from_slice(&mut bytes) {
+            Ok(val) => val,
+            Err(_) => continue,
+        };
+
+        // handle possible ret_code errors (v5)
+        if let Some(rc) = v.get("ret_code").and_then(|x| x.as_i64()) {
+            if rc != 0 {
+                ping_handle.abort();
+                return Err(anyhow::anyhow!("bybit ret_code {}: {:?}", rc, v));
+            }
+        }
+
+        // subscription ack
+        if let Some(op) = v.get("op").and_then(|x| x.as_str()) {
+            if op == "subscribe" {
+                // skip ack
+                continue;
+            }
+        }
+
+        if let Some(topic) = v.get("topic").and_then(|t| t.as_str()) {
+            if topic.starts_with("tickers.") {
+                if let Err(e) = handle_ticker_simd(&mut v, &mut batch_prices, &metrics).await {
+                    eprintln!("❌ [Bybit ticker handler]: {:?}", e);
+                }
+            } else if topic.starts_with("orderbook.1.") {
+                if let Err(e) =
+                    handle_orderbook_simd(&mut v, &mut best, &mut batch_orderbooks, &metrics).await
+                {
+                    eprintln!("❌ [Bybit orderbook handler]: {:?}", e);
+                }
+            } else if topic.starts_with("publicTrade.") {
+                if let Err(e) = handle_trade_simd(&mut v, &mut batch_trades, &metrics).await {
+                    eprintln!("❌ [Bybit trade handler]: {:?}", e);
+                }
+            }
+        }
+
+        // flush batches when full (pipelined)
+        if batch_prices.len() >= BATCH_FLUSH {
+            let mut pipe = redis::pipe();
+            for payload in batch_prices.drain(..) {
+                pipe.cmd("XADD")
+                    .arg("prices:bybit")
+                    .arg("MAXLEN")
+                    .arg("~")
+                    .arg(MAXLEN)
+                    .arg("*")
+                    .arg("data")
+                    .arg(payload);
+            }
+            let _: redis::RedisResult<()> = pipe.query_async(&mut redis_conn).await;
+        }
+        if batch_orderbooks.len() >= BATCH_FLUSH {
+            let mut pipe = redis::pipe();
+            for payload in batch_orderbooks.drain(..) {
+                pipe.cmd("XADD")
+                    .arg("orderbook:bybit")
+                    .arg("MAXLEN")
+                    .arg("~")
+                    .arg(MAXLEN)
+                    .arg("*")
+                    .arg("data")
+                    .arg(payload);
+            }
+            let _: redis::RedisResult<()> = pipe.query_async(&mut redis_conn).await;
+        }
+        if batch_trades.len() >= BATCH_FLUSH {
+            let mut pipe = redis::pipe();
+            for payload in batch_trades.drain(..) {
+                pipe.cmd("XADD")
+                    .arg("trades:bybit")
+                    .arg("MAXLEN")
+                    .arg("~")
+                    .arg(MAXLEN)
+                    .arg("*")
+                    .arg("data")
+                    .arg(payload);
+            }
+            let _: redis::RedisResult<()> = pipe.query_async(&mut redis_conn).await;
+        }
+    }
+
+    // final flush
+    if !batch_prices.is_empty() {
+        let mut pipe = redis::pipe();
+        for payload in batch_prices.drain(..) {
+            pipe.cmd("XADD")
+                .arg("prices:bybit")
+                .arg("MAXLEN")
+                .arg("~")
+                .arg(MAXLEN)
+                .arg("*")
+                .arg("data")
+                .arg(payload);
+        }
+        let _: redis::RedisResult<()> = pipe.query_async(&mut redis_conn).await;
+    }
+    if !batch_orderbooks.is_empty() {
+        let mut pipe = redis::pipe();
+        for payload in batch_orderbooks.drain(..) {
+            pipe.cmd("XADD")
+                .arg("orderbook:bybit")
+                .arg("MAXLEN")
+                .arg("~")
+                .arg(MAXLEN)
+                .arg("*")
+                .arg("data")
+                .arg(payload);
+        }
+        let _: redis::RedisResult<()> = pipe.query_async(&mut redis_conn).await;
+    }
+    if !batch_trades.is_empty() {
+        let mut pipe = redis::pipe();
+        for payload in batch_trades.drain(..) {
+            pipe.cmd("XADD")
+                .arg("trades:bybit")
+                .arg("MAXLEN")
+                .arg("~")
+                .arg(MAXLEN)
+                .arg("*")
+                .arg("data")
+                .arg(payload);
+        }
+        let _: redis::RedisResult<()> = pipe.query_async(&mut redis_conn).await;
+    }
+
+    ping_handle.abort();
+    Err(anyhow::anyhow!("bybit ws read ended"))
+}
+
+// ---------------- Handlers (SIMD parsed Value -> bincode -> batch) ----------------
+
+async fn handle_ticker_simd(
+    v: &mut Value,
+    batch: &mut Vec<Vec<u8>>,
+    metrics: &ThroughputMetrics,
+) -> Result<()> {
+    if let Some(data) = v.get("data") {
+        // data might be an object or array
+        if data.is_array() {
+            for item in data.as_array().unwrap().iter() {
+                if let Ok(td) = serde_json::from_value::<BybitTickerData>(item.clone()) {
+                    publish_ticker(td, v.get("ts").and_then(|x| x.as_u64()), batch, metrics)
+                        .await?;
+                }
+            }
+        } else if data.is_object() {
+            if let Ok(td) = serde_json::from_value::<BybitTickerData>(data.clone()) {
+                publish_ticker(td, v.get("ts").and_then(|x| x.as_u64()), batch, metrics).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn publish_ticker(
+    td: BybitTickerData,
+    ts_opt: Option<u64>,
+    batch: &mut Vec<Vec<u8>>,
+    metrics: &ThroughputMetrics,
+) -> Result<()> {
+    let nd = NormalizedData {
+        exchange: "bybit".into(),
+        symbol: td.symbol.clone(),
+        price: td
+            .last_price
+            .as_deref()
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0.0),
+        volume: td
+            .volume_24h
+            .as_deref()
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0.0),
+        high: td.high_24h.as_deref().unwrap_or("0").parse().unwrap_or(0.0),
+        low: td.low_24h.as_deref().unwrap_or("0").parse().unwrap_or(0.0),
+        timestamp: ts_opt.unwrap_or_else(current_millis),
+    };
+
+    let payload: Vec<u8> = bincode::serialize(&nd)?;
+    batch.push(payload);
+    metrics.incr_pub();
+    Ok(())
+}
+
+/// handle top-of-book orderbook updates
+async fn handle_orderbook_simd(
+    v: &mut Value,
+    best: &mut HashMap<String, (f64, f64, f64, f64)>,
+    batch: &mut Vec<Vec<u8>>,
+    metrics: &ThroughputMetrics,
+) -> Result<()> {
+    // expect v.data.b / v.data.a as arrays of arrays: [["price","size"], ...]
+    if let Some(data) = v.get("data") {
+        // data may be object (single symbol) or array
+        // For the v5 public API, 'data' is often an object with 'b' and 'a'
+        let bids_outer = data
+            .get("b")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let asks_outer = data
+            .get("a")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        if bids_outer.is_empty() || asks_outer.is_empty() {
+            return Ok(());
+        }
+
+        // extract first inner array elements safely
+        let (bid, bid_qty) = {
+            let first = bids_outer.get(0).and_then(|v| v.as_array());
+            if let Some(inner) = first {
+                let px = inner.get(0).and_then(|x| x.as_str()).unwrap_or("0");
+                let sz = inner.get(1).and_then(|x| x.as_str()).unwrap_or("0");
+                (
+                    px.parse::<f64>().unwrap_or(0.0),
+                    sz.parse::<f64>().unwrap_or(0.0),
+                )
+            } else {
+                (0.0, 0.0)
+            }
+        };
+
+        let (ask, ask_qty) = {
+            let first = asks_outer.get(0).and_then(|v| v.as_array());
+            if let Some(inner) = first {
+                let px = inner.get(0).and_then(|x| x.as_str()).unwrap_or("0");
+                let sz = inner.get(1).and_then(|x| x.as_str()).unwrap_or("0");
+                (
+                    px.parse::<f64>().unwrap_or(0.0),
+                    sz.parse::<f64>().unwrap_or(0.0),
+                )
+            } else {
+                (0.0, 0.0)
+            }
+        };
+
+        if bid <= 0.0 || ask <= 0.0 {
+            return Ok(());
+        }
+
+        // symbol from topic: topic = "orderbook.1.SYMBOL"
+        let symbol = v
+            .get("topic")
+            .and_then(|t| t.as_str())
+            .map(|s| s.trim_start_matches("orderbook.1.").to_string())
+            .unwrap_or_else(|| "".into());
+        if symbol.is_empty() {
+            return Ok(());
+        }
+
+        best.insert(symbol.clone(), (bid, ask, bid_qty, ask_qty));
+
+        let ob = OrderBookTop {
+            exchange: "bybit".into(),
+            symbol: symbol.clone(),
+            bid,
+            ask,
+            bid_qty,
+            ask_qty,
+            timestamp: v
+                .get("ts")
+                .and_then(|t| t.as_u64())
+                .unwrap_or_else(current_millis),
+        };
+
+        let payload: Vec<u8> = bincode::serialize(&ob)?;
+        batch.push(payload);
+        metrics.incr_pub();
+    }
+    Ok(())
+}
+
+async fn handle_trade_simd(
+    v: &mut Value,
+    batch: &mut Vec<Vec<u8>>,
+    metrics: &ThroughputMetrics,
+) -> Result<()> {
+    // data is often an array of trade objects
+    if let Some(arr) = v.get("data").and_then(|x| x.as_array()) {
+        for item in arr.iter() {
+            let symbol = item
+                .get("s")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if symbol.is_empty() {
+                continue;
+            }
+            let price = item
+                .get("p")
+                .and_then(|x| x.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            let qty = item
+                .get("q")
+                .and_then(|x| x.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            let side = if item.get("m").and_then(|x| x.as_bool()).unwrap_or(false) {
+                "sell".to_string()
+            } else {
+                "buy".to_string()
+            };
+            let timestamp = item
+                .get("T")
+                .and_then(|x| x.as_u64())
+                .unwrap_or_else(current_millis);
+
+            if price <= 0.0 || qty <= 0.0 {
+                continue;
+            }
+
+            let ev = TradeEvent {
+                exchange: "bybit".into(),
+                symbol,
+                price,
+                qty,
+                side,
+                timestamp,
+            };
+
+            let payload: Vec<u8> = bincode::serialize(&ev)?;
+            batch.push(payload);
+            metrics.incr_pub();
+        }
+    }
+    Ok(())
 }
 
 fn current_millis() -> u64 {

@@ -1,10 +1,14 @@
 mod config;
 mod exchange;
 mod exchanges;
+mod metrics;
 
 use crate::config::AppConfig;
 use crate::exchange::ExchangeClient;
-use crate::exchanges::{binance::BinanceCollector, bybit::BybitCollector, kraken::KrakenCollector};
+use crate::exchanges::{
+    binance::BinanceCollector, binance2::Binance2Collector, bybit::BybitCollector,
+    kraken::KrakenCollector,
+};
 use anyhow::Result;
 use futures_util::future;
 use tokio::time::{Duration, sleep};
@@ -21,9 +25,11 @@ async fn main() -> Result<()> {
             "binance" => {
                 println!("🟢 Initializing Binance collector...");
                 let redis_client = redis::Client::open(config.redis.uri.clone())?;
+                let topics = 9;
                 let mut collector = BinanceCollector {
                     symbols: ex.symbols.clone(),
                     redis_client,
+                    max_topics_per_conn: topics,
                 };
 
                 let mut price_collector = collector.clone();
@@ -46,13 +52,43 @@ async fn main() -> Result<()> {
                     }
                 }));
             }
+            "binance2" => {
+                println!("🟢 Initializing Binance2 collector...");
+                let redis_client = redis::Client::open(config.redis.uri.clone())?;
+                let mut collector = Binance2Collector {
+                    symbols: ex.symbols.clone(),
+                    redis_client,
+                };
+
+                let mut price_collector = collector.clone();
+                tasks.push(tokio::spawn(async move {
+                    if let Err(e) = price_collector.connect_price_stream().await {
+                        eprintln!("❌ [Binance2] Price stream error: {:?}", e);
+                    }
+                }));
+
+                let mut orderbook_collector = collector.clone();
+                tasks.push(tokio::spawn(async move {
+                    if let Err(e) = orderbook_collector.connect_orderbook_stream().await {
+                        eprintln!("❌ [Binance2] Orderbook stream error: {:?}", e);
+                    }
+                }));
+
+                tasks.push(tokio::spawn(async move {
+                    if let Err(e) = collector.connect_trades_stream().await {
+                        eprintln!("❌ [Binance2] Trades stream error: {:?}", e);
+                    }
+                }));
+            }
 
             "bybit" => {
                 println!("🟢 Initializing Bybit collector...");
                 let redis_client = redis::Client::open(config.redis.uri.clone())?;
+                let topics = 9;
                 let mut collector = BybitCollector {
                     symbols: ex.symbols.clone(),
                     redis_client,
+                    max_topics_per_conn: topics,
                 };
 
                 let mut price_collector = collector.clone();
