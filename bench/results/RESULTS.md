@@ -12,17 +12,50 @@ bounded band). What follows is which structure to use when, and why.
 
 ## 1. Environment & methodology
 
+> **Provenance note (2026-08-28).** On 2026-07-04 commit `8161464` re-ran most of this suite on
+> bare metal (Latitude `m4.metal.large`, AMD EPYC) and replaced `env.json`, six CSVs, every
+> `.hgrm` and every plot. **It did not regenerate this document.** The environment table below has
+> been corrected to match `env.json`, the per-file provenance is stated explicitly, and **every
+> throughput figure has been re-derived from the current `throughput.csv`** - so sections 3, 4 and
+> the headline table are current.
+>
+> **Section 2 is not, and its conclusion does not survive the re-run.** Its `update` p50 tables and
+> the `D*` crossover argument are laptop-era. On the current `service_sweep.csv` the Concentrated
+> case *inverts*: at depth 256 RevVec is 9 ns against SortedVec's 19 ns, where this document claims
+> RevVec is "persistently worse" from 256 up. The Uniform direction still holds qualitatively -
+> RevVec degrades 9 -> 29 -> 79 -> 259 -> 519 ns from depth 2 to 2048 while SortedVec stays at
+> 19-29 ns - but `D*` = 2 is not reproduced either; on EPYC the two are tied at the clock floor at
+> depth 2. The 10 ns clock floor on that host also quantizes every p50 to ~10 ns steps, which may
+> simply put the fine-grained crossover below the timer's resolution. **Read `service_sweep.csv`
+> directly; do not rely on section 2 until it is re-derived.** Section 5's `read_path` figures carry
+> the same caveat.
+>
+> Where this document and a committed CSV disagree, *the CSV is authoritative* - that is the rule
+> this repository is built on.
+
 | field | value (`env.json`) |
 |---|---|
-| CPU | 11th Gen Intel Core i5-1135G7 @ 2.40 GHz |
-| logical cores | 8 |
-| CPU governor | `powersave` (turbo not pinned) |
-| kernel | 7.0.0-15-generic |
-| rustc | 1.95.0 |
+| CPU | AMD EPYC 9254 24-Core Processor |
+| logical cores | 48 |
+| CPU governor | `performance` |
+| kernel | 6.8.0-124-generic |
+| rustc | 1.96.1 (31fca3adb 2026-06-26) |
 | `target-cpu` | native |
 | pinned core | 0 |
-| clock read-read floor | 7 ns (`clock_overhead_ns` column in every CSV) |
-| git commit | recorded in `env.json` |
+| clock read-read floor | 10 ns (`clock_overhead_ns` column in every CSV) |
+| git commit | `65a99462c6048c87b0a5a994d19cf7b224453137` (`env.json`) |
+
+**Which file came from which run** (from `git log` on each path, not from memory):
+
+| bare metal, EPYC - commit `8161464`, 2026-07-04 | laptop era - June 2026, not re-run |
+|---|---|
+| `read_path.csv`, `ring_bench.csv`, `seqlock_read.csv`, `service_sweep.csv`, `sustained.csv`, `throughput.csv`, every `.hgrm`, every plot, `perf/` | `branch_experiment.csv`, `cache_experiment.csv`, `e2e.csv`, `flat_memory.csv` |
+
+`env.json` describes the bare-metal column only. Section 4's memory-footprint figures (87.8 MiB
+real-book span, 0.13 MiB synthetic) rest on `flat_memory.csv` and are therefore laptop-era numbers;
+they are structural counts of ticks and bytes rather than timings, so the host does not change them.
+Every Mev/s and ns/event figure in this document has been re-derived from the current
+`throughput.csv`.
 
 Corpora fingerprints (length + first/last 16 bytes) are in `env.json`. All four corpora are
 deterministic (`feed` synthetic seed = 1, or the one recorded BTCUSDT session), so a run is
@@ -35,20 +68,20 @@ Benchmark 3 (`sustained`) is open-loop and **coordinated-omission-correct**: eve
 schedule and response latency is `completion − scheduled` (the scheduled arrival time), never
 `completion − apply_start`, so a book that falls behind accrues the backlog in its tail (proven
 by the `co_correct_records_accumulating_lag` harness test). Every measured op wraps inputs and
-outputs in `black_box`; ≥ 1,000,000 samples are taken per service-sweep cell; the 7 ns clock
+outputs in `black_box`; ≥ 1,000,000 samples are taken per service-sweep cell; the clock
 floor is reported and **never subtracted** — values at or below it are not resolvable.
 
 ### Threats to validity
 
-- **Timer floor (7 ns).** `best_bid` and shallow-depth `update` results sit at or just above the
-  floor; differences there are not resolvable and are reported as such, not as wins.
-- **Governor.** The service sweep ran `powersave`; the real-data study re-ran under `powersave` as well (the host has
-  no passwordless route to set `performance`, recorded in `env.json`). Frequency scaling adds
-  noise; it surfaces as occasional single-run p99/max outliers (e.g. `flat`/`uniform` `top_n_full`
-  at depth 2048 carries a `max` of 2,385,919 ns against a 1,990 ns p50, `read_path.csv`). These
-  are transient, not structural; p50/p99 across ≥ 1 M samples are stable.
-- **Single host.** All numbers are from the one i5-1135G7 above, built `target-cpu=native`; they
-  are host-specific by design and do not transfer.
+- **Timer floor.** `best_bid` and shallow-depth `update` results sit at or just above the clock
+  floor recorded in `env.json`; differences there are not resolvable and are reported as such, not
+  as wins.
+- **Governor.** The bare-metal re-run recorded `performance` in `env.json`. The laptop-era files in
+  the right-hand column above were taken under `powersave`, where frequency scaling adds noise and
+  surfaces as occasional single-run p99/max outliers; p50/p99 across ≥ 1 M samples are stable.
+- **Two hosts, not one.** This suite spans the two runs tabulated above, built `target-cpu=native`
+  in both cases. Numbers are host-specific by design and do not transfer between the two columns,
+  so no figure here should be compared across them.
 - **Elision.** Guarded in tests: `update` cost scales with depth for `RevVec`, `top_n_full`
   scales with depth, and the measured floor is checked against the clock floor; a flat or zero
   result would have failed those guards.
@@ -56,6 +89,11 @@ floor is reported and **never subtracted** — values at or below it are not res
 ---
 
 ## 2. The four-way crossover is locality-gated (`service_sweep.csv`)
+
+> **Stale — see the provenance note in section 1.** These tables and the `D*` argument are
+> laptop-era, and the Concentrated conclusion **inverts** on the current `service_sweep.csv`
+> (depth 256: RevVec 9 ns vs SortedVec 19 ns). Treat this section's heading as an open question,
+> not a result, until it is re-derived. The CSV is authoritative.
 
 `update` is an in-place qty replace at an existing level: it isolates *locate* cost (linear
 scan vs binary search vs tree descent vs direct index) from memmove. Figures:
@@ -118,24 +156,26 @@ response time.**
 
 | corpus | btree (Mev/s) | sorted (Mev/s) | rev (Mev/s) | flat (Mev/s) |
 |---|---|---|---|---|
-| steady (100k) | 44.8 | 74.0 | 66.1 | **113.0** |
-| burst (100k) | 45.8 | 76.4 | 66.5 | **115.7** |
-| flashcrash (100k) | 51.6 | 73.8 | 74.1 | 64.6 |
-| btcusdt-sample (13,765) | **23.2** | 16.0 | 4.5 | 0.09 |
+| steady (100k) | 51.4 | 95.8 | 80.3 | **134.1** |
+| burst (100k) | 50.6 | 94.5 | 80.1 | **134.4** |
+| flashcrash (100k) | 59.1 | **92.7** | 89.3 | 83.1 |
+| btcusdt-sample (13,765) | **26.5** | 16.8 | 5.2 | 0.09 |
 
-On the synthetic profiles the array structures win — FlatBook leads at 113.0 Mev/s (steady),
-SortedVec next at 74.0, RevVec 66.1, BTree trails at 44.8. **On the real BTCUSDT corpus the
-ranking fully inverts: BTree is fastest at 23.2 Mev/s, SortedVec 16.0, RevVec 4.5, and FlatBook
-collapses to 0.09 Mev/s (10,926 ns/event).**
+On the synthetic profiles the array structures win — FlatBook leads at 134.1 Mev/s (steady),
+SortedVec next at 95.8, RevVec 80.3, BTree trails at 51.4. **On the real BTCUSDT corpus the
+ranking fully inverts: BTree is fastest at 26.5 Mev/s, SortedVec 16.8, RevVec 5.2, and FlatBook
+collapses to 0.09 Mev/s (10,896 ns/event).**
 
 ### Triangulating the real touch distribution
 
-RevVec's real throughput is 4.5 Mev/s ≈ 222 ns/event (`throughput.csv`, btcusdt-sample
-`ns_per_event` = 222.34). Place that against RevVec's synthetic `update` service costs
+RevVec's real throughput is 5.2 Mev/s ≈ 191 ns/event (`throughput.csv`, btcusdt-sample
+`ns_per_event` = 191.00). Place that against RevVec's synthetic `update` service costs
 (`service_sweep.csv`): Concentrated is 8–21 ns at every depth, while Uniform climbs 38 ns
-(depth 64) → 100 ns (256) → 183 ns (512) → 353 ns (1024) → 697 ns (2048). A 222 ns/event real
-cost sits firmly in RevVec's **Uniform, deep** regime (between its depth-512 and depth-1024
-Uniform costs), not anywhere near its 8–21 ns Concentrated regime. Were the real feed
+(depth 64) → 100 ns (256) → 183 ns (512) → 353 ns (1024) → 697 ns (2048). Those service costs are
+laptop-era while the 191 ns is bare-metal, so read this as a regime argument and not as a
+quantitative bracket. A 191 ns/event real cost sits in RevVec's **Uniform, deep** regime, an order
+of magnitude away from its 8–21 ns Concentrated regime — a gap far wider than the difference
+between the two hosts. Were the real feed
 top-of-book-concentrated, RevVec would replay at tens of ns/event (≈ 50–125 Mev/s); it does
 not. Therefore the real touch/insert distribution is **moderately deep and spread across the
 ladder** — precisely the regime that defeats a linear scan, and the reason the synthetic-vs-real
@@ -145,8 +185,8 @@ ranking inverts.
 
 H5 predicted FlatBook's `O(1)` update would let it **lead** real throughput and resolve the
 rev-collapse. The service-time half holds (§2). The throughput half does **not**: FlatBook
-replays the real corpus at **0.09 Mev/s, 10,926 ns/event** (`throughput.csv`), ~250× slower
-than BTree. The mechanism is in `flat_memory.csv`: the real BTCUSDT book spans **5,753,082 ticks
+replays the real corpus at **0.09 Mev/s, 10,896 ns/event** (`throughput.csv`), ~288× slower
+than BTree (37.79 ns/event). The mechanism is in `flat_memory.csv`: the real BTCUSDT book spans **5,753,082 ticks
 (92,049,312 bytes ≈ 87.8 MiB)** across the two side arrays, versus 8,193 ticks (131,088 bytes
 ≈ 0.13 MiB) for every synthetic corpus. A cold replay from `FlatBook::default()` walks outward
 across that 5.75 M-tick span; each out-of-range price triggers a recenter/grow that reallocates
@@ -161,6 +201,9 @@ levels — it neither memmoves (RevVec/SortedVec) nor allocates over a tick span
 ---
 
 ## 4. The flat-array tradeoff, quantified (`flat_memory.csv`, `read_path.csv`)
+
+> **Partly stale.** The `read_path.csv` figures here predate the bare-metal re-run; the
+> `flat_memory.csv` tick and byte counts are structural and unaffected. See section 1.
 
 FlatBook buys `O(1)` depth-and-locality-independent update (§2) and `O(1)` best access at three
 costs, each measured.
@@ -193,12 +236,15 @@ measurement above and does not surface as a separate regression at these depths.
 
 ## 5. Which structure when — sourced recommendation
 
+> **Partly stale.** The `service_sweep` and `read_path` figures quoted here predate the re-run;
+> the throughput figures are current. See section 1.
+
 | regime | use | sourced basis |
 |---|---|---|
 | shallow, top-of-book-concentrated touches | RevVec or SortedVec | `update` p50 ~8 ns at the floor, depths 8–128 Concentrated (`service_sweep.csv`); both beat BTree's 16–19 ns |
 | deep, touches spread across the ladder | SortedVec | `update` p50 14 ns at depth 2048 Uniform vs RevVec 697 ns and BTree 50 ns (`service_sweep.csv`) |
-| deep, **unbounded / wide** price range (the real-feed case) | BTree | fastest on the real BTCUSDT replay at 23.2 Mev/s vs sorted 16.0, rev 4.5, flat 0.09 (`throughput.csv`); span-agnostic where FlatBook needs 87.8 MiB (`flat_memory.csv`) |
-| deep, **bounded** span, warm/amortized book | FlatBook | `update` p50 14 ns regardless of depth/locality (`service_sweep.csv`) and 113.0 Mev/s on the bounded synthetic steady corpus (`throughput.csv`), at ~0.13 MiB (`flat_memory.csv`) — but **only** when the span is bounded and the recenter cost is amortized, not paid on a cold wide-span replay |
+| deep, **unbounded / wide** price range (the real-feed case) | BTree | fastest on the real BTCUSDT replay at 26.5 Mev/s vs sorted 16.8, rev 5.2, flat 0.09 (`throughput.csv`); span-agnostic where FlatBook needs 87.8 MiB (`flat_memory.csv`) |
+| deep, **bounded** span, warm/amortized book | FlatBook | `update` p50 14 ns regardless of depth/locality (`service_sweep.csv`) and 134.1 Mev/s on the bounded synthetic steady corpus (`throughput.csv`), at ~0.13 MiB (`flat_memory.csv`) — but **only** when the span is bounded and the recenter cost is amortized, not paid on a cold wide-span replay |
 
 FlatBook is the structurally-correct answer to the rev-collapse **on service time and on a
 bounded span**; it is the wrong answer on an unbounded real feed, where its strength (a flat
@@ -208,6 +254,10 @@ winner — the right container is a function of depth, touch locality, and price
 ---
 
 ## 6. Hypotheses — outcomes (each with a sourced number)
+
+> **Partly stale.** Outcomes resting on `service_sweep` / `read_path` predate the re-run, and
+> H1/H2 depend on the section 2 crossover that the current data does not reproduce.
+> Throughput-based outcomes are current. See section 1.
 
 - **H1 — RevVec dominates at shallow / top-concentrated: partially confirmed (refined).** At
   Concentrated depths 8–128 RevVec sits at the timer floor (p50 8 ns) and beats BTree (16–19 ns),
@@ -219,9 +269,9 @@ winner — the right container is a function of depth, touch locality, and price
   depth 2048: 697 ns vs 14 ns, `service_sweep.csv`). The crossover is locality-gated.
 - **H3 — BTree loses across realistic depths and pays an O(log n) best-access tax: split.**
   BTree loses on `update` at essentially every depth (Concentrated p50 16→31 ns, Uniform
-  16→50 ns vs the Vecs) and on synthetic throughput (44.8 vs 74.0 Mev/s steady, `throughput.csv`)
+  16→50 ns vs the Vecs) and on synthetic throughput (51.4 vs sorted 95.8 / rev 80.3 Mev/s steady, `throughput.csv`)
   — confirmed. The specific best-access tax is **inconclusive**: `best_bid` p50 is 10–11 ns ≈ the
-  7 ns clock floor for all impls (`read_path.csv`), so any `O(log n)` descent sits below the
+  clock floor for all impls (`read_path.csv`), so any `O(log n)` descent sits below the
   timer floor; the tree's structural cost does surface on `top_n_full` (3,517 ns vs ~616 ns at
   depth 2048).
 - **H4 — the RevVec↔SortedVec crossover sits at some `D*`/locality: confirmed.** `D*` = 256
@@ -231,7 +281,7 @@ winner — the right container is a function of depth, touch locality, and price
   split (service-time half confirmed, real-throughput half refuted).** Confirmed on service time:
   `update` p50 is a flat 14 ns across depth in both localities, vs RevVec's 697 ns at Uniform
   depth 2048 (`service_sweep.csv`). Refuted on real throughput: FlatBook replays the real
-  BTCUSDT corpus at 0.09 Mev/s (10,926 ns/event, `throughput.csv`) — last, not first — because
+  BTCUSDT corpus at 0.09 Mev/s (10,896 ns/event, `throughput.csv`) — last, not first — because
   the real book's 5,753,082-tick span (87.8 MiB, `flat_memory.csv`) makes the cold-replay
   recenter/grow cost dominate. The honest finding: `O(1)` update does not imply leading
   throughput when the price span is unbounded.
@@ -239,6 +289,9 @@ winner — the right container is a function of depth, touch locality, and price
 ---
 
 ## 7. Sustained, coordinated-omission-correct response time (`sustained.csv`)
+
+> **Stale.** Every figure in this section predates the bare-metal re-run of `sustained.csv`.
+> Read the CSV directly. See section 1.
 
 Figures: `plots/sustained_p99_vs_rate_{steady,burst,flashcrash}.svg`. **Response time under a
 schedule — not service time.**
@@ -319,7 +372,8 @@ cargo build --release -p bench
 ./target/release/bench all --core 0
 ```
 
-Conditions for every result above are the `env.json` manifest: i5-1135G7, `powersave` governor,
-pinned core 0, `target-cpu=native`, 7 ns clock floor. With `FlatBook` the order-book shootout is
+Conditions are the `env.json` manifest and the per-run provenance table in section 1: bare-metal
+EPYC 9254, `performance` governor, pinned core 0, `target-cpu=native`, 10 ns clock floor for the
+re-run files; the four laptop-era files are listed separately there. With `FlatBook` the order-book shootout is
 complete: four implementations behind one frozen trait, proven identical, measured, and
 judged with a sourced verdict.
